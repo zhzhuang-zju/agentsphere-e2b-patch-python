@@ -1,9 +1,9 @@
-*.
+.*
 !.gitignore
 __pycache__/
 *.py[cod]
 *$py.class
-dist/*.tar.gz
+dist/
 build/
 venv/
 htmlcov/
