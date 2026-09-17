@@ -4,6 +4,7 @@ from agentsphere_e2b_patch._hook import (
     TRAFFIC_HEADER,
     _EXTRA_ATTR,
     _FLAG,
+    _patch_template_class,
     _inject,
     _wrap_init,
     install,
@@ -95,3 +96,92 @@ def test_traffic_headers():
 
 def test_install_without_e2b_does_not_raise():
     install()
+
+
+def test_template_build_serializes_agencies():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        def __init__(self, template):
+            self._template = template
+
+        @classmethod
+        def build(cls, template, **kwargs):
+            return template._template._serialize([])
+
+        @classmethod
+        def build_in_background(cls, template, **kwargs):
+            return template._template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        template = Template(TemplateBase())
+        assert Template.build(template, agencies={"runtimeAgency": "agency"}) == {
+            "steps": [],
+            "force": False,
+            "agencies": {"runtimeAgency": "agency"},
+        }
+        assert not hasattr(template._template, "_agentsphere_build_extensions")
+    finally:
+        uninstall()
+
+
+def test_template_build_serializes_all_extensions():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {"name": "template"}
+            return template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        result = Template.build(
+            TemplateBase(),
+            name="template",
+            outbound_network={"isPrivateConnect": True},
+            invoke={"protocol": "http", "port": 8080},
+            agencies={"runtimeAgency": "agency"},
+            ping={"enabled": True},
+            observability={"logs": {"enableStdLogs": True}},
+            session_storage_config={"mountDir": "/mnt/session"},
+            storage_config={"obsMounts": [{"bucket": "bucket"}]},
+        )
+        assert result == {
+            "steps": [],
+            "force": False,
+            "outboundNetwork": {"isPrivateConnect": True},
+            "invoke": {"protocol": "http", "port": 8080},
+            "agencies": {"runtimeAgency": "agency"},
+            "ping": {"enabled": True},
+            "observability": {"logs": {"enableStdLogs": True}},
+            "sessionStorageConfig": {"mountDir": "/mnt/session"},
+            "storageConfig": {"obsMounts": [{"bucket": "bucket"}]},
+        }
+    finally:
+        uninstall()
+
+
+def test_template_build_without_agencies_is_unchanged():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        @classmethod
+        def build(cls, template, **kwargs):
+            return template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        assert Template.build(TemplateBase()) == {"steps": [], "force": False}
+    finally:
+        uninstall()

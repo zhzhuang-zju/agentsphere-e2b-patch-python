@@ -6,21 +6,40 @@ import functools
 import importlib
 import logging
 import sys
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 TRAFFIC_HEADER = "e2b-traffic-access-token"
 _FLAG = "_agentsphere_e2b_patched"
 _EXTRA_ATTR = "_ConnectionConfig__extra_sandbox_headers"
+_EXTENSIONS_ATTR = "_agentsphere_build_extensions"
 
 _logger = logging.getLogger(__name__)
 
 # Class objects we have wrapped, mapped to the original ``__init__``.
 _originals: Dict[int, Tuple[type, Callable[..., None]]] = {}
+_template_originals: Dict[int, Tuple[type, str, Any]] = {}
 
 # Modules whose Sandbox / AsyncSandbox we wrap as soon as they appear.
 _WATCHED = {
     "e2b.sandbox_sync.main": "Sandbox",
     "e2b.sandbox_async.main": "AsyncSandbox",
+}
+
+_TEMPLATE_MODULES = {
+    "e2b.template.main": "TemplateBase",
+    "e2b.template_sync.main": "Template",
+    "e2b.template_async.main": "AsyncTemplate",
+}
+_WATCHED_MODULES = {**_WATCHED, **_TEMPLATE_MODULES}
+_BUILD_EXTENSIONS = {
+    "outbound_network": "outboundNetwork",
+    "invoke": "invoke",
+    "agencies": "agencies",
+    "ping": "ping",
+    "observability": "observability",
+    "session_storage_config": "sessionStorageConfig",
+    "storage_config": "storageConfig",
 }
 
 
@@ -69,6 +88,79 @@ def _wrap_init(cls: type) -> None:
     cls.__init__ = __init__
 
 
+def _wrap_template_serialize(cls: type) -> None:
+    original = cls._serialize
+    if getattr(original, _FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def _serialize(self, *args, **kwargs):
+        serialized = original(self, *args, **kwargs)
+        extensions = getattr(self, _EXTENSIONS_ATTR, None)
+        if extensions is not None:
+            for field_name, value in extensions.items():
+                if not isinstance(value, Mapping):
+                    raise TypeError(f"{field_name} must be a mapping")
+                serialized[_BUILD_EXTENSIONS[field_name]] = dict(value)
+        return serialized
+
+    setattr(_serialize, _FLAG, True)
+    _template_originals[id(cls)] = (cls, "_serialize", original)
+    cls._serialize = _serialize
+
+
+def _call_with_extensions(
+    template: Any, extensions: Dict[str, Any], callback: Callable[[], Any]
+) -> Any:
+    if not extensions:
+        return callback()
+    template_impl = getattr(template, "_template", template)
+    had_previous = hasattr(template_impl, _EXTENSIONS_ATTR)
+    previous = getattr(template_impl, _EXTENSIONS_ATTR, None)
+    setattr(template_impl, _EXTENSIONS_ATTR, extensions)
+    try:
+        return callback()
+    finally:
+        if had_previous:
+            setattr(template_impl, _EXTENSIONS_ATTR, previous)
+        else:
+            delattr(template_impl, _EXTENSIONS_ATTR)
+
+
+def _wrap_template_build(cls: type, name: str) -> None:
+    descriptor = cls.__dict__.get(name)
+    if not isinstance(descriptor, classmethod):
+        return
+    original = descriptor.__func__
+    if getattr(original, _FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def build(owner, template, *args, **kwargs):
+        extensions = {
+            field_name: kwargs.pop(field_name)
+            for field_name in _BUILD_EXTENSIONS
+            if field_name in kwargs and kwargs[field_name] is not None
+        }
+        return _call_with_extensions(
+            template,
+            extensions,
+            lambda: original(owner, template, *args, **kwargs),
+        )
+
+    setattr(build, _FLAG, True)
+    _template_originals[id(cls) ^ hash(name)] = (cls, name, descriptor)
+    setattr(cls, name, classmethod(build))
+
+
+def _patch_template_class(module_name: str, cls: type) -> None:
+    if module_name == "e2b.template.main":
+        _wrap_template_serialize(cls)
+    else:
+        _wrap_template_build(cls, "build")
+        _wrap_template_build(cls, "build_in_background")
+
+
 def _iter_sandbox_classes() -> Iterable[type]:
     seen: set[int] = set()
     for modname, attr in _WATCHED.items():
@@ -91,6 +183,17 @@ def _iter_sandbox_classes() -> Iterable[type]:
             yield cls
 
 
+def _iter_template_classes() -> Iterable[Tuple[str, type]]:
+    for modname, attr in _TEMPLATE_MODULES.items():
+        try:
+            module = importlib.import_module(modname)
+            cls = getattr(module, attr)
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(cls, type):
+            yield modname, cls
+
+
 def _patch_loaded_modules() -> None:
     for modname, attr in _WATCHED.items():
         module = sys.modules.get(modname)
@@ -99,6 +202,13 @@ def _patch_loaded_modules() -> None:
         cls = getattr(module, attr, None)
         if isinstance(cls, type):
             _wrap_init(cls)
+    for modname, attr in _TEMPLATE_MODULES.items():
+        module = sys.modules.get(modname)
+        if module is None:
+            continue
+        cls = getattr(module, attr, None)
+        if isinstance(cls, type):
+            _patch_template_class(modname, cls)
 
 
 def _try_import_and_patch() -> bool:
@@ -106,6 +216,9 @@ def _try_import_and_patch() -> bool:
     patched = False
     for cls in _iter_sandbox_classes():
         _wrap_init(cls)
+        patched = True
+    for modname, cls in _iter_template_classes():
+        _patch_template_class(modname, cls)
         patched = True
     return patched
 
@@ -140,7 +253,7 @@ class _WhenImportedFinder:
         self._busy = False
 
     def find_spec(self, fullname, path, target=None):  # noqa: ANN001 — import-hook signature
-        if fullname not in _WATCHED or self._busy:
+        if fullname not in _WATCHED_MODULES or self._busy:
             return None
         self._busy = True
         try:
@@ -156,12 +269,17 @@ class _WhenImportedFinder:
                     break
             if spec is None or spec.loader is None:
                 return spec
-            attr = _WATCHED[fullname]
+            attr = _WATCHED_MODULES[fullname]
 
-            def _callback(module: Any, _attr: str = attr) -> None:
+            def _callback(
+                module: Any, _attr: str = attr, _modname: str = fullname
+            ) -> None:
                 cls = getattr(module, _attr, None)
                 if isinstance(cls, type):
-                    _wrap_init(cls)
+                    if _modname in _WATCHED:
+                        _wrap_init(cls)
+                    else:
+                        _patch_template_class(_modname, cls)
 
             spec.loader = _LoaderProxy(spec.loader, _callback)
             return spec
@@ -190,6 +308,9 @@ def uninstall() -> None:
     for cls, original in list(_originals.values()):
         cls.__init__ = original
     _originals.clear()
+    for cls, name, original in list(_template_originals.values()):
+        setattr(cls, name, original)
+    _template_originals.clear()
     sys.meta_path[:] = [
         finder
         for finder in sys.meta_path
