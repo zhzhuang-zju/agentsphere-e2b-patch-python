@@ -51,7 +51,9 @@ template = (
 
 build = Template.build(
 	template,
-	name="my-template",
+	alias="my-template-alias",
+	arch="arm64",
+	gateway_id="gateway-id",
 	outbound_network={
 		"isPrivateConnect": True,
 		"targetProjectId": "project-id",
@@ -127,9 +129,12 @@ build = Template.build(
 print(f"template build started: {build}")
 ```
 
-这些字段在 Python 中使用 snake_case 参数名，例如 `outbound_network`、
-`session_storage_config` 和 `storage_config`，patch 会将它们转换为请求体中的
-JSON 字段名。`Template.build_in_background` 以及异步 SDK 的对应方法也支持同样的参数。
+`alias`、`arch` 和 `gateway_id` 会写入 create template 请求
+(`TemplateBuildRequestV3`)；其余扩展字段会写入 start build 请求
+(`TemplateBuildStartV2`)。这些字段在 Python 中使用 snake_case 参数名，例如
+`outbound_network`、`session_storage_config`、`storage_config` 和 `gateway_id`，
+patch 会将它们转换为请求体中的 JSON 字段名。`Template.build_in_background` 以及
+异步 SDK 的对应方法也支持同样的参数。
 
 但如果是 editable 安装（`pip install -e .`）或环境禁用了 `.pth`，就需要增加导入的代码：
 

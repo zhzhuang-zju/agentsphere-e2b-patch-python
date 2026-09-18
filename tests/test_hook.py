@@ -4,6 +4,8 @@ from agentsphere_e2b_patch._hook import (
     TRAFFIC_HEADER,
     _EXTRA_ATTR,
     _FLAG,
+    _call_with_extensions,
+    _wrap_create_request_model,
     _patch_template_class,
     _inject,
     _wrap_init,
@@ -146,6 +148,8 @@ def test_template_build_serializes_all_extensions():
         result = Template.build(
             TemplateBase(),
             name="template",
+            arch="arm64",
+            gateway_id="gateway",
             outbound_network={"isPrivateConnect": True},
             invoke={"protocol": "http", "port": 8080},
             agencies={"runtimeAgency": "agency"},
@@ -183,5 +187,34 @@ def test_template_build_without_agencies_is_unchanged():
     _patch_template_class("e2b.template_sync.main", Template)
     try:
         assert Template.build(TemplateBase()) == {"steps": [], "force": False}
+    finally:
+        uninstall()
+
+
+def test_template_build_request_serializes_create_extensions():
+    class TemplateBuildRequest:
+        def __init__(self, **kwargs):
+            self.alias = kwargs.get("alias")
+            self.additional_properties = {}
+
+        def to_dict(self):
+            result = dict(self.additional_properties)
+            if self.alias is not None:
+                result["alias"] = self.alias
+            return result
+
+    _wrap_create_request_model(TemplateBuildRequest)
+    try:
+        result = _call_with_extensions(
+            object(),
+            {},
+            {"alias": "my-alias", "arch": "arm64", "gateway_id": "gateway"},
+            lambda: TemplateBuildRequest(),
+        )
+        assert result.to_dict() == {
+            "alias": "my-alias",
+            "arch": "arm64",
+            "gatewayID": "gateway",
+        }
     finally:
         uninstall()
