@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import inspect
 import logging
 import sys
 from contextvars import ContextVar
@@ -175,7 +176,7 @@ def _call_with_extensions(
 
 
 def _wrap_template_build(cls: type, name: str) -> None:
-    descriptor = cls.__dict__.get(name)
+    descriptor = inspect.getattr_static(cls, name, None)
     if not isinstance(descriptor, classmethod):
         return
     original = descriptor.__func__

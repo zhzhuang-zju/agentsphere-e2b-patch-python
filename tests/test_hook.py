@@ -218,3 +218,20 @@ def test_template_build_request_serializes_create_extensions():
         }
     finally:
         uninstall()
+
+
+def test_template_build_wrapper_handles_inherited_classmethod():
+    class TemplateBase:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {}
+            return template
+
+    class Template(TemplateBase):
+        pass
+
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        assert Template.build(object(), arch="arm64") is not None
+    finally:
+        uninstall()
