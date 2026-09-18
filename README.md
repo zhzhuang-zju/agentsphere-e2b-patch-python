@@ -18,7 +18,7 @@
 # 安装 e2b ：agentsphere-e2b-patch 只是 patch，官方 SDK 是必须的
 pip install e2b
 # 安装 agentsphere 的 e2b patch, 注意修改为实际版本
-pip install ./agentsphere_e2b_patch-0.1.0-py3-none-any.whl
+pip install ./agentsphere_e2b_patch-0.1.1-py3-none-any.whl
 ```
 
 使用方式同普通 E2B SDK，正常情况下 agentsphere patch 会自动生效，对用户代码没有侵入：

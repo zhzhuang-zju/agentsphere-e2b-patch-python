@@ -1,3 +1,5 @@
+import asyncio
+import sys
 from types import SimpleNamespace
 
 from agentsphere_e2b_patch._hook import (
@@ -7,6 +9,7 @@ from agentsphere_e2b_patch._hook import (
     _call_with_extensions,
     _wrap_create_request_model,
     _patch_template_class,
+    _patch_loaded_modules,
     _inject,
     _wrap_init,
     install,
@@ -233,5 +236,43 @@ def test_template_build_wrapper_handles_inherited_classmethod():
     _patch_template_class("e2b.template_sync.main", Template)
     try:
         assert Template.build(object(), arch="arm64") is not None
+    finally:
+        uninstall()
+
+
+def test_patch_loaded_modules_uses_top_level_template_export(monkeypatch):
+    class VendorTemplate:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {}
+            return template
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(Template=VendorTemplate))
+    _patch_loaded_modules()
+    try:
+        assert getattr(VendorTemplate.build, _FLAG)
+        assert VendorTemplate.build(object(), arch="arm64") is not None
+    finally:
+        uninstall()
+
+
+def test_async_template_build_keeps_extensions_until_awaited():
+    class TemplateImpl:
+        pass
+
+    class AsyncTemplate:
+        @classmethod
+        async def build(cls, template, **kwargs):
+            await asyncio.sleep(0)
+            return getattr(template, "_agentsphere_build_extensions")
+
+    _patch_template_class("vendor.async_template", AsyncTemplate)
+    try:
+        template = TemplateImpl()
+        result = asyncio.run(
+            AsyncTemplate.build(template, agencies={"runtimeAgency": "agency"})
+        )
+        assert result == {"agencies": {"runtimeAgency": "agency"}}
+        assert not hasattr(template, "_agentsphere_build_extensions")
     finally:
         uninstall()

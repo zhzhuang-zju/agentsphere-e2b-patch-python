@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsphere-e2b-patch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Patch the official E2B Python SDK so envd (port 49983) requests send e2b-traffic-access-token."
 readme = "README.md"
 requires-python = ">=3.9"

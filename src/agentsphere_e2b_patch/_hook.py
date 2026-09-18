@@ -104,7 +104,9 @@ def _wrap_init(cls: type) -> None:
 
 
 def _wrap_template_serialize(cls: type) -> None:
-    original = cls._serialize
+    original = getattr(cls, "_serialize", None)
+    if not callable(original):
+        return
     if getattr(original, _FLAG, False):
         return
 
@@ -175,6 +177,48 @@ def _call_with_extensions(
                 delattr(template_impl, _EXTENSIONS_ATTR)
 
 
+async def _call_with_async_extensions(
+    template: Any,
+    extensions: Dict[str, Any],
+    create_extensions: Dict[str, Any],
+    callback: Callable[[], Any],
+) -> Any:
+    if not extensions and not create_extensions:
+        return await callback()
+    template_impl = getattr(template, "_template", template) if extensions else None
+    had_previous = template_impl is not None and hasattr(template_impl, _EXTENSIONS_ATTR)
+    previous = getattr(template_impl, _EXTENSIONS_ATTR, None)
+    if template_impl is not None:
+        setattr(template_impl, _EXTENSIONS_ATTR, extensions)
+    token = _create_extensions.set(create_extensions)
+    try:
+        return await callback()
+    finally:
+        _create_extensions.reset(token)
+        if template_impl is not None:
+            if had_previous:
+                setattr(template_impl, _EXTENSIONS_ATTR, previous)
+            else:
+                delattr(template_impl, _EXTENSIONS_ATTR)
+
+
+def _pop_build_extensions(kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    extensions = {
+        field_name: kwargs.pop(field_name)
+        for field_name in _BUILD_EXTENSIONS
+        if field_name in kwargs and kwargs[field_name] is not None
+    }
+    create_extensions = {}
+    for field_name in _CREATE_BUILD_EXTENSIONS:
+        if field_name in kwargs:
+            value = kwargs.pop(field_name)
+            if value is not None:
+                create_extensions[field_name] = value
+    if kwargs.get("alias") is not None:
+        create_extensions["alias"] = kwargs["alias"]
+    return extensions, create_extensions
+
+
 def _wrap_template_build(cls: type, name: str) -> None:
     descriptor = inspect.getattr_static(cls, name, None)
     if not isinstance(descriptor, classmethod):
@@ -183,27 +227,29 @@ def _wrap_template_build(cls: type, name: str) -> None:
     if getattr(original, _FLAG, False):
         return
 
-    @functools.wraps(original)
-    def build(owner, template, *args, **kwargs):
-        extensions = {
-            field_name: kwargs.pop(field_name)
-            for field_name in _BUILD_EXTENSIONS
-            if field_name in kwargs and kwargs[field_name] is not None
-        }
-        create_extensions = {}
-        for field_name in _CREATE_BUILD_EXTENSIONS:
-            if field_name in kwargs:
-                value = kwargs.pop(field_name)
-                if value is not None:
-                    create_extensions[field_name] = value
-        if kwargs.get("alias") is not None:
-            create_extensions["alias"] = kwargs["alias"]
-        return _call_with_extensions(
-            template,
-            extensions,
-            create_extensions,
-            lambda: original(owner, template, *args, **kwargs),
-        )
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def build(owner, template, *args, **kwargs):
+            extensions, create_extensions = _pop_build_extensions(kwargs)
+            return await _call_with_async_extensions(
+                template,
+                extensions,
+                create_extensions,
+                lambda: original(owner, template, *args, **kwargs),
+            )
+
+    else:
+
+        @functools.wraps(original)
+        def build(owner, template, *args, **kwargs):
+            extensions, create_extensions = _pop_build_extensions(kwargs)
+            return _call_with_extensions(
+                template,
+                extensions,
+                create_extensions,
+                lambda: original(owner, template, *args, **kwargs),
+            )
 
     setattr(build, _FLAG, True)
     _template_originals[id(cls) ^ hash(name)] = (cls, name, descriptor)
@@ -211,11 +257,10 @@ def _wrap_template_build(cls: type, name: str) -> None:
 
 
 def _patch_template_class(module_name: str, cls: type) -> None:
-    if module_name == "e2b.template.main":
+    if hasattr(cls, "_serialize"):
         _wrap_template_serialize(cls)
-    else:
-        _wrap_template_build(cls, "build")
-        _wrap_template_build(cls, "build_in_background")
+    _wrap_template_build(cls, "build")
+    _wrap_template_build(cls, "build_in_background")
 
 
 def _patch_loaded_model() -> None:
@@ -250,14 +295,25 @@ def _iter_sandbox_classes() -> Iterable[type]:
 
 
 def _iter_template_classes() -> Iterable[Tuple[str, type]]:
+    seen: set[int] = set()
     for modname, attr in _TEMPLATE_MODULES.items():
         try:
             module = importlib.import_module(modname)
             cls = getattr(module, attr)
         except (ImportError, AttributeError):
             continue
-        if isinstance(cls, type):
+        if isinstance(cls, type) and id(cls) not in seen:
+            seen.add(id(cls))
             yield modname, cls
+    try:
+        e2b = importlib.import_module("e2b")
+    except ImportError:
+        return
+    for attr in ("Template", "AsyncTemplate"):
+        cls = getattr(e2b, attr, None)
+        if isinstance(cls, type) and id(cls) not in seen:
+            seen.add(id(cls))
+            yield cls.__module__, cls
 
 
 def _patch_loaded_modules() -> None:
@@ -276,6 +332,12 @@ def _patch_loaded_modules() -> None:
         cls = getattr(module, attr, None)
         if isinstance(cls, type):
             _patch_template_class(modname, cls)
+    e2b = sys.modules.get("e2b")
+    if e2b is not None:
+        for attr in ("Template", "AsyncTemplate"):
+            cls = getattr(e2b, attr, None)
+            if isinstance(cls, type):
+                _patch_template_class(cls.__module__, cls)
 
 
 def _try_import_and_patch() -> bool:
