@@ -1,9 +1,15 @@
+import asyncio
+import sys
 from types import SimpleNamespace
 
 from agentsphere_e2b_patch._hook import (
     TRAFFIC_HEADER,
     _EXTRA_ATTR,
     _FLAG,
+    _call_with_extensions,
+    _wrap_create_request_model,
+    _patch_template_class,
+    _patch_loaded_modules,
     _inject,
     _wrap_init,
     install,
@@ -95,3 +101,190 @@ def test_traffic_headers():
 
 def test_install_without_e2b_does_not_raise():
     install()
+
+
+def test_template_build_serializes_agencies():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        def __init__(self, template):
+            self._template = template
+
+        @classmethod
+        def build(cls, template, **kwargs):
+            return template._template._serialize([])
+
+        @classmethod
+        def build_in_background(cls, template, **kwargs):
+            return template._template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        template = Template(TemplateBase())
+        assert Template.build(template, agencies={"runtimeAgency": "agency"}) == {
+            "steps": [],
+            "force": False,
+            "agencies": {"runtimeAgency": "agency"},
+        }
+        assert not hasattr(template._template, "_agentsphere_build_extensions")
+    finally:
+        uninstall()
+
+
+def test_template_build_serializes_all_extensions():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {"name": "template"}
+            return template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        result = Template.build(
+            TemplateBase(),
+            name="template",
+            arch="arm64",
+            gateway_id="gateway",
+            outbound_network={
+                "isPrivateConnect": True,
+                "targetProjectId": "project-id",
+                "targetVpcId": "vpc-id",
+                "targetSubnetId": "subnet-id",
+                "targetSecurityGroupIds": ["sg-id-1", "sg-id-2"],
+            },
+            invoke={"protocol": "http", "port": 8080},
+            agencies={"runtimeAgency": "agency"},
+            ping={"enabled": True},
+            observability={"logs": {"enableStdLogs": True}},
+            session_storage_config={"mountDir": "/mnt/session"},
+            storage_config={"obsMounts": [{"bucket": "bucket"}]},
+        )
+        assert result == {
+            "steps": [],
+            "force": False,
+            "outboundNetwork": {
+                "isPrivateConnect": True,
+                "targetProjectId": "project-id",
+                "targetVpcId": "vpc-id",
+                "targetSubnetId": "subnet-id",
+                "targetSecurityGroupIds": ["sg-id-1", "sg-id-2"],
+            },
+            "invoke": {"protocol": "http", "port": 8080},
+            "agencies": {"runtimeAgency": "agency"},
+            "ping": {"enabled": True},
+            "observability": {"logs": {"enableStdLogs": True}},
+            "sessionStorageConfig": {"mountDir": "/mnt/session"},
+            "storageConfig": {"obsMounts": [{"bucket": "bucket"}]},
+        }
+    finally:
+        uninstall()
+
+
+def test_template_build_without_agencies_is_unchanged():
+    class TemplateBase:
+        def _serialize(self, steps):
+            return {"steps": steps, "force": False}
+
+    class Template:
+        @classmethod
+        def build(cls, template, **kwargs):
+            return template._serialize([])
+
+    _patch_template_class("e2b.template.main", TemplateBase)
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        assert Template.build(TemplateBase()) == {"steps": [], "force": False}
+    finally:
+        uninstall()
+
+
+def test_template_build_request_serializes_create_extensions():
+    class TemplateBuildRequest:
+        def __init__(self, **kwargs):
+            self.alias = kwargs.get("alias")
+            self.additional_properties = {}
+
+        def to_dict(self):
+            result = dict(self.additional_properties)
+            if self.alias is not None:
+                result["alias"] = self.alias
+            return result
+
+    _wrap_create_request_model(TemplateBuildRequest)
+    try:
+        result = _call_with_extensions(
+            object(),
+            {},
+            {"alias": "my-alias", "arch": "arm64", "gateway_id": "gateway"},
+            lambda: TemplateBuildRequest(),
+        )
+        assert result.to_dict() == {
+            "alias": "my-alias",
+            "arch": "arm64",
+            "gatewayID": "gateway",
+        }
+    finally:
+        uninstall()
+
+
+def test_template_build_wrapper_handles_inherited_classmethod():
+    class TemplateBase:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {}
+            return template
+
+    class Template(TemplateBase):
+        pass
+
+    _patch_template_class("e2b.template_sync.main", Template)
+    try:
+        assert Template.build(object(), arch="arm64") is not None
+    finally:
+        uninstall()
+
+
+def test_patch_loaded_modules_uses_top_level_template_export(monkeypatch):
+    class VendorTemplate:
+        @classmethod
+        def build(cls, template, **kwargs):
+            assert kwargs == {}
+            return template
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(Template=VendorTemplate))
+    _patch_loaded_modules()
+    try:
+        assert getattr(VendorTemplate.build, _FLAG)
+        assert VendorTemplate.build(object(), arch="arm64") is not None
+    finally:
+        uninstall()
+
+
+def test_async_template_build_keeps_extensions_until_awaited():
+    class TemplateImpl:
+        pass
+
+    class AsyncTemplate:
+        @classmethod
+        async def build(cls, template, **kwargs):
+            await asyncio.sleep(0)
+            return getattr(template, "_agentsphere_build_extensions")
+
+    _patch_template_class("vendor.async_template", AsyncTemplate)
+    try:
+        template = TemplateImpl()
+        result = asyncio.run(
+            AsyncTemplate.build(template, agencies={"runtimeAgency": "agency"})
+        )
+        assert result == {"agencies": {"runtimeAgency": "agency"}}
+        assert not hasattr(template, "_agentsphere_build_extensions")
+    finally:
+        uninstall()

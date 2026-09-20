@@ -4,6 +4,7 @@
 
 - 为访问 envd（端口 **49983**）的请求自动带上 e2b-traffic-access-token header，值来自 create sandbox 或者 connect sandbox 时返回的 `traffic_access_token`。
 - 为访问 envd（端口 **49983**）之外的其他数据面请求提供帮助函数，方便设置 e2b-traffic-access-token header
+- 为 E2B template start build 增加非原生的 `outboundNetwork`、`invoke`、`agencies`、`ping`、`observability`、`sessionStorageConfig` 和 `storageConfig` 请求字段
 
 ## 安装
 
@@ -17,7 +18,7 @@
 # 安装 e2b ：agentsphere-e2b-patch 只是 patch，官方 SDK 是必须的
 pip install e2b
 # 安装 agentsphere 的 e2b patch, 注意修改为实际版本
-pip install ./agentsphere_e2b_patch-0.1.0-py3-none-any.whl
+pip install ./agentsphere_e2b_patch-0.1.1-py3-none-any.whl
 ```
 
 使用方式同普通 E2B SDK，正常情况下 agentsphere patch 会自动生效，对用户代码没有侵入：
@@ -27,6 +28,113 @@ from e2b import Sandbox
 
 sandbox = Sandbox.create(...) 
 ```
+
+构建 template 时可以通过额外的 snake_case 参数设置 Agentsphere 的扩展字段。下面是一个完整示例：
+
+```python
+# 如果通过 wheel 安装且 Python 会自动加载 .pth 文件，这一行可以省略。
+import agentsphere_e2b_patch
+
+from e2b import Template
+
+template = (
+	Template()
+	.from_image("python:3.11-slim")
+	.run_cmd("pip install fastapi uvicorn")
+	.run_cmd("mkdir -p /app")
+	.copy("app.py", "/app/app.py")
+	.set_start_cmd(
+		"uvicorn app:app --host 0.0.0.0 --port 8080",
+		"curl --fail http://localhost:8080/health",
+	)
+)
+
+build = Template.build(
+	template,
+	alias="my-template-alias",
+	arch="arm64",
+	gateway_id="gateway-id",
+	outbound_network={
+		"isPrivateConnect": True,
+		"targetProjectId": "project-id",
+		"targetVpcId": "vpc-id",
+		"targetSubnetId": "subnet-id",
+		"targetSecurityGroupIds": ["sg-id-1", "sg-id-2"],
+	},
+	invoke={
+		"protocol": "http",
+		"port": 8080,
+	},
+	agencies={
+		"runtimeAgency": "my-agency",
+	},
+	ping={
+		"enabled": True,
+		"path": "/health",
+		"protocol": "http",
+		"port": 8080,
+		"warmUpProbe": {
+			"initialDelaySeconds": 1,
+			"timeoutSeconds": 5,
+			"periodSeconds": 2,
+			"failureThreshold": 10,
+		},
+		"livenessProbe": {
+			"periodSeconds": 10,
+			"timeoutSeconds": 5,
+			"failureThreshold": 3,
+		},
+	},
+	observability={
+		"logs": {
+			"enableStdLogs": True,
+			"ltsProjectId": "logs-project-id",
+			"ltsGroupId": "logs-group-id",
+			"ltsStreamId": "logs-stream-id",
+		},
+		"metrics": {
+			"enableSystemMetrics": True,
+			"aomProjectId": "aom-project-id",
+			"aomInstanceId": "aom-instance-id",
+		},
+		"relabeling": {
+			"rules": [],
+		},
+	},
+	session_storage_config={
+		"mountDir": "/mnt/session",
+	},
+	storage_config={
+		"obsMounts": [
+			{
+				"bucket": "my-bucket",
+				"bucketPath": "templates/data",
+				"mountDir": "/mnt/obs",
+				"readOnly": True,
+			}
+		],
+		"sfsTurboMounts": [
+			{
+				"sfsTurboId": "sfs-turbo-id",
+				"shareRoot": "/",
+				"sharePath": "/templates/data",
+				"mountDir": "/mnt/sfs",
+				"readOnly": False,
+				"withSessionCredential": True,
+			}
+		],
+	},
+)
+
+print(f"template build started: {build}")
+```
+
+`alias`、`arch` 和 `gateway_id` 会写入 create template 请求
+(`TemplateBuildRequestV3`)；其余扩展字段会写入 start build 请求
+(`TemplateBuildStartV2`)。这些字段在 Python 中使用 snake_case 参数名，例如
+`outbound_network`、`session_storage_config`、`storage_config` 和 `gateway_id`，
+patch 会将它们转换为请求体中的 JSON 字段名。`Template.build_in_background` 以及
+异步 SDK 的对应方法也支持同样的参数。
 
 但如果是 editable 安装（`pip install -e .`）或环境禁用了 `.pth`，就需要增加导入的代码：
 
